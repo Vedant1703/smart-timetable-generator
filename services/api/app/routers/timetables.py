@@ -1,0 +1,309 @@
+"""Timetables router — generate + GET under /api/v1/tenants/{tenantId}/timetables."""
+
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.tenant_context import set_tenant_context
+from app.models.assignment import Assignment
+from app.models.batch import Batch
+from app.models.cohort import Cohort
+from app.models.course import Course
+from app.models.eligibility import Eligibility
+from app.models.period_template import PeriodTemplate
+from app.models.room import Room
+from app.models.staff_availability_block import StaffAvailabilityBlock
+from app.models.staff_profile import StaffProfile
+from app.models.timetable_version import TimetableVersion
+from app.schemas.timetable import AssignmentRead, GenerateRequest, GenerateResponse, TimetableRead
+
+# Import solver — it lives in a sibling package, imported at call time
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "solver"))
+
+router = APIRouter(prefix="/api/v1/tenants/{tenantId}/timetables", tags=["timetables"])
+
+
+@router.post("/generate", response_model=GenerateResponse)
+async def generate_timetable(
+    tenantId: UUID,
+    body: GenerateRequest,
+    db: AsyncSession = Depends(set_tenant_context),
+):
+    """Phase 1: synchronous single-cohort generation."""
+    from solver.data_types import (
+        SolverInput, FacultyData, CourseData, CohortData,
+        BatchData, RoomData, EligibilityData, PeriodSlot, BlockedSlot,
+    )
+    from solver.model import solve
+    from solver.conflict_checker import check_all
+
+    # Load all master data for the tenant
+    cohort_result = await db.execute(select(Cohort))
+    cohorts = list(cohort_result.scalars().all())
+    if not cohorts:
+        raise HTTPException(status_code=404, detail={"error": {"code": "NOT_FOUND", "message": "No cohorts found for tenant"}})
+
+    # Batches
+    batch_result = await db.execute(select(Batch))
+    batches = list(batch_result.scalars().all())
+
+    # Eligibility for all cohorts/batches
+    elig_result = await db.execute(select(Eligibility))
+    eligibilities = list(elig_result.scalars().all())
+    if not eligibilities:
+        raise HTTPException(status_code=400, detail={"error": {"code": "VALIDATION_ERROR", "message": "No eligibility records found"}})
+
+    # Courses involved
+    course_ids = list(set(e.course_id for e in eligibilities))
+    courses_result = await db.execute(select(Course).where(Course.id.in_(course_ids)))
+    courses = {c.id: c for c in courses_result.scalars().all()}
+
+    # Faculty involved
+    faculty_ids = list(set(e.staff_profile_id for e in eligibilities))
+    faculty_result = await db.execute(select(StaffProfile).where(StaffProfile.id.in_(faculty_ids)))
+    faculty = {f.id: f for f in faculty_result.scalars().all()}
+
+    # Rooms
+    rooms_result = await db.execute(select(Room))
+    rooms = {r.id: r for r in rooms_result.scalars().all()}
+
+    # Period templates
+    pt_result = await db.execute(select(PeriodTemplate).order_by(PeriodTemplate.weekday, PeriodTemplate.period_index))
+    period_templates = list(pt_result.scalars().all())
+
+    # Blocked slots
+    blocked_result = await db.execute(
+        select(StaffAvailabilityBlock).where(
+            StaffAvailabilityBlock.staff_profile_id.in_(faculty_ids)
+        )
+    )
+    blocked_slots = list(blocked_result.scalars().all())
+
+    # Build solver input
+    solver_faculty = []
+    for fid, f in faculty.items():
+        solver_faculty.append(FacultyData(
+            id=str(fid),
+            workload_cap_week=f.workload_cap_week,
+            workload_cap_day=f.workload_cap_day,
+        ))
+
+    solver_courses = []
+    for cid, c in courses.items():
+        solver_courses.append(CourseData(
+            id=str(cid),
+            type=c.type,
+            hours_per_week=c.hours_per_week,
+            block_size=c.block_size,
+            required_equipment_tags=c.required_equipment_tags or [],
+        ))
+
+    solver_cohorts = [CohortData(id=str(c.id), name=c.name) for c in cohorts]
+    
+    solver_batches = [BatchData(
+        id=str(b.id),
+        label=b.label,
+        cohort_id=str(b.cohort_id),
+        course_id=str(b.course_id),
+    ) for b in batches]
+
+    solver_rooms = []
+    for rid, r in rooms.items():
+        solver_rooms.append(RoomData(
+            id=str(rid),
+            type=r.type,
+            capacity=r.capacity,
+            equipment_tags=r.equipment_tags or [],
+        ))
+
+    solver_elig = []
+    for e in eligibilities:
+        solver_elig.append(EligibilityData(
+            faculty_id=str(e.staff_profile_id),
+            course_id=str(e.course_id),
+            cohort_id=str(e.batch_id) if e.batch_id else str(e.cohort_id),
+        ))
+
+    # Build period slots: each (weekday, period_index) → a unique integer slot
+    slots_by_day: dict[int, list[int]] = {}
+    slot_index = 0
+    slot_map: dict[tuple[int, int], int] = {}
+    for pt in period_templates:
+        slot_map[(pt.weekday, pt.period_index)] = slot_index
+        slots_by_day.setdefault(pt.weekday, []).append(slot_index)
+        slot_index += 1
+
+    period_slots = [
+        PeriodSlot(slot_index=slot_map[(pt.weekday, pt.period_index)], weekday=pt.weekday, period_index=pt.period_index)
+        for pt in period_templates
+    ]
+
+    solver_blocked = []
+    for b in blocked_slots:
+        key = (b.weekday, b.period_index)
+        if key in slot_map:
+            solver_blocked.append(BlockedSlot(
+                faculty_id=str(b.staff_profile_id),
+                slot_index=slot_map[key],
+            ))
+
+    room_type_counts = {}
+    for r in rooms.values():
+        room_type_counts[r.type] = room_type_counts.get(r.type, 0) + 1
+
+    # Load Phase 3 Student Data
+    from app.models.student_profile import StudentProfile
+    from app.models.batch_membership import BatchMembership
+    from app.models.enrollment_record import EnrollmentRecord
+    from app.models.elective_section import ElectiveSection
+    from solver.data_types import StudentData, StudentCourseData
+
+    stud_result = await db.execute(select(StudentProfile))
+    db_students = list(stud_result.scalars().all())
+
+    bm_result = await db.execute(select(BatchMembership))
+    db_batch_memberships = list(bm_result.scalars().all())
+
+    enr_result = await db.execute(select(EnrollmentRecord))
+    db_enrollments = list(enr_result.scalars().all())
+
+    es_result = await db.execute(select(ElectiveSection))
+    db_elective_sections = {es.id: es for es in es_result.scalars().all()}
+
+    # Map student -> batches
+    student_batches: dict[UUID, list[UUID]] = {}
+    for bm in db_batch_memberships:
+        student_batches.setdefault(bm.student_profile_id, []).append(bm.batch_id)
+
+    # Map student -> elective courses
+    student_electives: dict[UUID, list[UUID]] = {}
+    for enr in db_enrollments:
+        es = db_elective_sections.get(enr.elective_section_id)
+        if es:
+            student_electives.setdefault(enr.student_profile_id, []).append(es.course_id)
+
+    # Build solver_students
+    solver_students = []
+    # Create a quick lookup for batch_id -> course_id to know which course the batch belongs to
+    batch_to_course = {b.id: b.course_id for b in batches}
+    
+    for s in db_students:
+        s_courses = []
+        
+        # 1. Core courses for this student's cohort
+        # Any eligibility for this cohort that is NOT batch-level and NOT an elective the student ISN'T in
+        # Actually, it's easier: check all eligibilities for this student's cohort.
+        for e in eligibilities:
+            # We only care about courses for this student's cohort
+            # Wait, `e.cohort_id` could be the parent cohort.
+            if e.cohort_id != s.cohort_id:
+                continue
+
+            course = courses.get(e.course_id)
+            if not course:
+                continue
+
+            # If it's a batch-split course (there are batches for it in this cohort)
+            # The student is only enrolled if they have a batch membership for it
+            batches_for_course = [b for b in batches if b.course_id == e.course_id and b.cohort_id == s.cohort_id]
+            
+            if batches_for_course:
+                # Student must be in one of these batches to take the course
+                student_bms = student_batches.get(s.id, [])
+                for b in batches_for_course:
+                    if b.id in student_bms:
+                        s_courses.append(StudentCourseData(course_id=str(course.id), cohort_id=str(s.cohort_id), batch_id=str(b.id)))
+                        break
+            else:
+                # It's a whole-cohort course
+                if course.type == "elective":
+                    # Check if student is enrolled
+                    if course.id in student_electives.get(s.id, []):
+                        s_courses.append(StudentCourseData(course_id=str(course.id), cohort_id=str(s.cohort_id), batch_id=None))
+                else:
+                    # Core course
+                    s_courses.append(StudentCourseData(course_id=str(course.id), cohort_id=str(s.cohort_id), batch_id=None))
+
+        solver_students.append(StudentData(id=str(s.id), courses=s_courses))
+
+    solver_input = SolverInput(
+        faculty=solver_faculty,
+        courses=solver_courses,
+        cohorts=solver_cohorts,
+        batches=solver_batches,
+        rooms=solver_rooms,
+        eligibility=solver_elig,
+        period_slots=period_slots,
+        blocked_slots=solver_blocked,
+        slots_per_day=slots_by_day,
+        num_slots=slot_index,
+        room_type_counts=room_type_counts,
+        students=solver_students,
+    )
+
+    # Solve
+    result = solve(solver_input)
+    if result is None:
+        raise HTTPException(status_code=422, detail={
+            "error": {"code": "INFEASIBLE_CONFIGURATION", "message": "No feasible timetable found for this configuration", "details": {}}
+        })
+
+    # Verify independently (invariant #2)
+    violations = check_all(result, solver_input)
+
+    # Store results
+    tv = TimetableVersion(tenant_id=tenantId, term_id=body.term_id, state="draft")
+    db.add(tv)
+    await db.flush()
+
+    for a in result:
+        assignment = Assignment(
+            tenant_id=tenantId,
+            timetable_version_id=tv.id,
+            staff_profile_id=UUID(a.faculty_id),
+            course_id=UUID(a.course_id),
+            cohort_id=UUID(a.cohort_id),
+            room_id=UUID(a.room_id),
+            slot_start=a.slot_index,
+            slot_span=a.slot_span,
+            batch_id=UUID(a.batch_id) if a.batch_id else None,
+        )
+        db.add(assignment)
+
+    await db.commit()
+    await db.refresh(tv)
+
+    return GenerateResponse(
+        timetable_version_id=tv.id,
+        status="draft",
+        violations=[{"h_code": v.h_code, "message": v.message} for v in violations],
+    )
+
+
+@router.get("/{versionId}", response_model=TimetableRead)
+async def get_timetable(
+    tenantId: UUID,
+    versionId: UUID,
+    db: AsyncSession = Depends(set_tenant_context),
+):
+    tv_result = await db.execute(select(TimetableVersion).where(TimetableVersion.id == versionId))
+    tv = tv_result.scalar_one_or_none()
+    if not tv:
+        raise HTTPException(status_code=404, detail={"error": {"code": "NOT_FOUND", "message": "Timetable version not found"}})
+
+    assign_result = await db.execute(
+        select(Assignment).where(Assignment.timetable_version_id == versionId)
+    )
+    assignments = list(assign_result.scalars().all())
+
+    return TimetableRead(
+        id=tv.id,
+        tenant_id=tv.tenant_id,
+        state=tv.state,
+        version_no=tv.version_no,
+        assignments=[AssignmentRead.model_validate(a) for a in assignments],
+    )
