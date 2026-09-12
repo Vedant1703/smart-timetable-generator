@@ -30,7 +30,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body?.error?.message ?? `HTTP ${res.status}`);
+    const err = new Error(body?.error?.message ?? `HTTP ${res.status}`);
+    (err as any).details = body?.error?.details;
+    (err as any).code = body?.error?.code;
+    throw err;
   }
   return res.json();
 }
@@ -133,12 +136,14 @@ export interface Course {
 
 export interface StaffProfile {
   id: string;
-  identity_id: string;
   tenant_id: string;
-  employment_type: string;
+  identity_id: string;
+  employment_type: 'full_time' | 'part_time' | 'visiting';
   workload_cap_week: number;
   workload_cap_day: number;
   roles: string[];
+  full_name?: string;
+  email?: string;
 }
 
 export interface Rule {
@@ -187,6 +192,13 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ version_no: versionNo }),
       }),
+    edit: (tenantId: string, versionId: string, data: { assignment_id: string; slot_start?: number; staff_profile_id?: string; room_id?: string; version_no: number }) =>
+      request<{ assignment_id: string; new_version_no: number }>(`/api/v1/tenants/${tenantId}/timetables/${versionId}/edit`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    exportUrl: (tenantId: string, versionId: string, format: 'csv' | 'ics' | 'pdf') =>
+      `${BASE}/api/v1/tenants/${tenantId}/timetables/${versionId}/export?format=${format}`,
   },
   rules: {
     parse: (tenantId: string, rawInputText: string) =>
@@ -233,10 +245,6 @@ export const api = {
     create: (tenantId: string, data: Partial<Department>) =>
       request<Department>(`/api/v1/tenants/${tenantId}/departments`, { method: 'POST', body: JSON.stringify(data) }),
   },
-  students: {
-    list: (tenantId: string) =>
-      request<PaginatedResponse<any>>(`/api/v1/tenants/${tenantId}/student-profiles?limit=500`),
-  },
   terms: {
     list: (tenantId: string) =>
       request<PaginatedResponse<AcademicTerm>>(`/api/v1/tenants/${tenantId}/terms?limit=10`),
@@ -270,5 +278,50 @@ export const api = {
   substitutions: {
     list: (tenantId: string) => 
       request<{ items: any[] }>(`/api/v1/tenants/${tenantId}/substitutions`),
-  }
+    suggest: (tenantId: string, data: { absent_staff_profile_id: string; assignment_id: string; date: string; version_no: number }) =>
+      request<{ substitution_id: string; candidates: { staff_profile_id: string; current_load: number }[] }>(`/api/v1/tenants/${tenantId}/substitutions`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    confirm: (tenantId: string, substitutionId: string, data: { substitute_staff_profile_id: string; version_no: number }) =>
+      request<{ substitution_id: string; new_version_no: number }>(`/api/v1/tenants/${tenantId}/substitutions/${substitutionId}/confirm`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+  },
+  import: {
+    faculty: (tenantId: string, rows: any[]) =>
+      request<{ success_count: number; errors: any[] }>(`/api/v1/tenants/${tenantId}/import/faculty`, {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      }),
+    courses: (tenantId: string, rows: any[]) =>
+      request<{ success_count: number; errors: any[] }>(`/api/v1/tenants/${tenantId}/import/courses`, {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      }),
+    rooms: (tenantId: string, rows: any[]) =>
+      request<{ success_count: number; errors: any[] }>(`/api/v1/tenants/${tenantId}/import/rooms`, {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      }),
+    enrollments: (tenantId: string, rows: any[]) =>
+      request<{ success_count: number; errors: any[] }>(`/api/v1/tenants/${tenantId}/import/enrollment`, {
+        method: 'POST',
+        body: JSON.stringify({ rows }),
+      }),
+  },
+  notifications: {
+    list: (tenantId: string) =>
+      request<PaginatedResponse<any>>(`/api/v1/tenants/${tenantId}/notifications`),
+    markRead: (tenantId: string, notificationId: string) =>
+      request<{ status: string }>(`/api/v1/tenants/${tenantId}/notifications/${notificationId}/read`, { method: 'PUT' }),
+    getPreferences: (tenantId: string) =>
+      request<{ email: boolean; push: boolean; sms: boolean }>(`/api/v1/tenants/${tenantId}/notifications/preferences`),
+    updatePreferences: (tenantId: string, data: { email: boolean; push: boolean; sms: boolean }) =>
+      request<{ email: boolean; push: boolean; sms: boolean }>(`/api/v1/tenants/${tenantId}/notifications/preferences`, {
+        method: 'PUT',
+        body: JSON.stringify(data),
+      }),
+  },
 };
